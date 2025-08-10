@@ -1,118 +1,152 @@
 import torch
-from transformers import AutoProcessor, AutoModelForImageTextToText, AutoTokenizer, AutoModel
+import faiss
+import duckdb
+import numpy as np
 from pdf2image import convert_from_path
 from PIL import Image
-import numpy as np
-from huggingface_hub import hf_hub_download
 from tqdm import tqdm
+from transformers import AutoProcessor, AutoModelForImageTextToText, AutoTokenizer, AutoModel
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-# device = "mps"
-
-
-# -------- Step 1: Model loading with progress --------
-# print("Downloading & loading SmolDocling...")
-# doc_model_name = "ds4sd/SmolDocling-256M-preview"
-# doc_processor = AutoProcessor.from_pretrained(doc_model_name, use_fast=True, truncation=True)
-# doc_model = AutoModelForImageTextToText.from_pretrained(doc_model_name).to(device)
-# doc_model.eval()  # Set model to evaluation mode
-
-# -------- 1. Load RolmOCR for OCR --------
-print("Loading RolmOCR model...")
+# ---------- Config ----------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ocr_model_name = "reducto/RolmOCR"
-ocr_processor = AutoProcessor.from_pretrained(ocr_model_name, use_fast=True, truncation=True)
+text_emb_name = "BAAI/bge-large-en-v1.5"
+img_emb_name = "openai/clip-vit-large-patch14"
+faiss_path = "document_index.faiss"
+db_path = "metadata.duckdb"
+
+# ---------- Load Models ----------
+print("Loading RolmOCR...")
+ocr_processor = AutoProcessor.from_pretrained(ocr_model_name, use_fast=True)
 ocr_model = AutoModelForImageTextToText.from_pretrained(ocr_model_name).to(device)
 
+print("Loading text embedding model...")
+text_tokenizer = AutoTokenizer.from_pretrained(text_emb_name)
+text_emb_model = AutoModel.from_pretrained(text_emb_name).to(device)
 
-# -------- 2. Load text embedding model --------
-print("Downloading & loading text embedding model...")
-text_emb_model_name = "BAAI/bge-large-en-v1.5"
-text_tokenizer = AutoTokenizer.from_pretrained(text_emb_model_name, use_fast=True)
-text_model = AutoModel.from_pretrained(text_emb_model_name).to(device)
-text_model.eval()
+print("Loading image embedding model...")
+clip_processor = AutoProcessor.from_pretrained(img_emb_name)
+clip_model = AutoModel.from_pretrained(img_emb_name).to(device)
 
-# -------- 3. Load image embedding model --------
-print("Downloading & loading image embedding model...")
-img_emb_model_name = "openai/clip-vit-large-patch14"
-clip_processor = AutoProcessor.from_pretrained(img_emb_model_name, use_fast=True)
-clip_model = AutoModel.from_pretrained(img_emb_model_name).to(device)
-clip_model.eval()
 
-# -------- Helper: Extract text from page image --------
+# ---------- Helper Functions ----------
 def extract_text_from_image(image: Image.Image) -> str:
-    messages = [
-        {"role": "user", "content": [
-            {"type": "image"},
-            {"type": "text", "text": "Extract all the content from this page as plain text."}
-        ]}
-    ]
+    messages = [{"role": "user", "content": [
+        {"type": "image"},
+        {"type": "text", "text": "Extract the plain text from this page."}
+    ]}]
     prompt = ocr_processor.apply_chat_template(messages, add_generation_prompt=True)
     inputs = ocr_processor(text=prompt, images=[image], return_tensors="pt").to(device)
     with torch.no_grad():
-        generated_ids = ocr_model.generate(**inputs, max_new_tokens=8192)
+        gen = ocr_model.generate(**inputs, max_new_tokens=4096)
     prompt_len = inputs.input_ids.shape[1]
-    trimmed = generated_ids[:, prompt_len:]
-    text = ocr_processor.batch_decode(trimmed, skip_special_tokens=False)[0].lstrip()
-    # Clean the output
-    # text = text.replace("<end_of_utterance>", "").strip()
+    trimmed = gen[:, prompt_len:]
+    return ocr_processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
-    return text
-
-# -------- Helper: Get text embedding --------
-def get_text_embedding(text: str):
-    inputs = text_tokenizer(text, return_tensors="pt", truncation=True).to(device)
+def get_text_embedding(text: str) -> np.ndarray:
+    tokens = text_tokenizer(text, return_tensors="pt", truncation=True).to(device)
     with torch.no_grad():
-        outputs = text_model(**inputs)
-    emb = outputs.last_hidden_state.mean(dim=1).cpu().numpy()[0]
-    print(f"Text embedding shape: {emb.shape}")
-    return emb
+        out = text_emb_model(**tokens)
+    return out.last_hidden_state.mean(dim=1).cpu().numpy()[0]
 
-# -------- Helper: Get image embedding --------
-def get_image_embedding(image: Image.Image):
-    inputs = clip_processor(images=image, return_tensors="pt").to(device)
+def get_image_embedding(image: Image.Image) -> np.ndarray:
+    proc = clip_processor(images=image, return_tensors="pt").to(device)
     with torch.no_grad():
-        outputs = clip_model.get_image_features(**inputs)
-    emb = outputs.cpu().numpy()[0]
-    print(f"Image embedding shape: {emb.shape}")
-    return emb
+        feat = clip_model.get_image_features(**proc)
+    return feat.cpu().numpy()[0]
 
-# -------- Combine embeddings --------
-def combine_embeddings(text_emb, image_emb, method="concat"):
-    if method == "concat":
-        return np.concatenate([text_emb, image_emb]).tolist()
-    elif method == "average":
-        return ((text_emb + image_emb) / 2).tolist()
-    else:
-        raise ValueError("Unknown method")
+def combine_embeddings(te, ie, method="concat"):
+    te_arr, ie_arr = np.array(te), np.array(ie)
+    return np.concatenate((te_arr, ie_arr)).astype("float32") if method == "concat" else ((te_arr + ie_arr) / 2).astype("float32")
 
-# -------- Main: Process PDF --------
-def pdf_to_multimodal_embeddings(pdf_path, method="concat"):
-    images = convert_from_path(pdf_path, dpi=150)
-    all_page_embeddings = []
 
-    for page_num, image in enumerate(tqdm(images, desc="Processing pages")):
-        # Extract text
-        text = extract_text_from_image(image)
+# ---------- Database Setup ----------
+def init_databases(embedding_size):
+    # FAISS
+    try:
+        index = faiss.read_index(faiss_path)
+    except:
+        index = faiss.IndexFlatL2(embedding_size)
 
-        # Generate embeddings
-        text_emb = get_text_embedding(text)
-        image_emb = get_image_embedding(image)
+    # DuckDB
+    con = duckdb.connect(db_path)
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS metadata (
+        id INTEGER PRIMARY KEY,
+        document_class TEXT,
+        filename TEXT,
+        page_number INTEGER
+    )
+    """)
+    con.close()
 
-        # Combine
-        final_emb = combine_embeddings(text_emb, image_emb, method=method)
+    return index
 
-        all_page_embeddings.append({
-            "page": page_num + 1,
-            "text": text,
-            "embedding": final_emb
-        })
 
-    return all_page_embeddings
+# ---------- Store PDF Embeddings ----------
+def store_pdf(pdf_path, document_class, method="concat"):
+    pages = convert_from_path(pdf_path, dpi=150)
 
-# -------- Example usage --------
+    # Example embedding to determine dimensionality
+    sample_text = get_text_embedding("test")
+    sample_img = get_image_embedding(pages[0])
+    sample_emb = combine_embeddings(sample_text, sample_img, method)
+    index = init_databases(len(sample_emb))
+
+    con = duckdb.connect(db_path)
+
+    current_id = index.ntotal
+    for page_num, img in enumerate(tqdm(pages, desc="Processing pages")):
+        text = extract_text_from_image(img)
+        te = get_text_embedding(text)
+        ie = get_image_embedding(img)
+        emb = combine_embeddings(te, ie, method)
+
+        index.add(np.array([emb], dtype="float32"))
+
+        con.execute("""
+        INSERT INTO metadata (id, document_class, filename, page_number)
+        VALUES (?, ?, ?, ?)
+        """, (current_id, document_class, pdf_path, page_num + 1))
+
+        current_id += 1
+
+    faiss.write_index(index, faiss_path)
+    con.close()
+    print(f"✅ Stored embeddings for {pdf_path} as class '{document_class}'")
+
+
+# ---------- Classification ----------
+def classify_document(pdf_path, k=3, method="concat"):
+    index = faiss.read_index(faiss_path)
+    con = duckdb.connect(db_path, read_only=True)
+
+    class_votes = {}
+    pages = convert_from_path(pdf_path, dpi=150)
+
+    for img in tqdm(pages, desc="Classifying pages"):
+        text = extract_text_from_image(img)
+        te = get_text_embedding(text)
+        ie = get_image_embedding(img)
+        emb = combine_embeddings(te, ie, method).reshape(1, -1)
+
+        distances, indices = index.search(emb, k)
+
+        for idx in indices[0]:
+            doc_class = con.execute("SELECT document_class FROM metadata WHERE id = ?", (int(idx),)).fetchone()[0]
+            class_votes[doc_class] = class_votes.get(doc_class, 0) + 1
+
+    con.close()
+    predicted_class = max(class_votes, key=class_votes.get)
+    return predicted_class, class_votes
+
+
+# ---------- Example ----------
 if __name__ == "__main__":
-    pdf_path = "your_document.pdf"
-    embeddings = pdf_to_multimodal_embeddings(pdf_path)
+    # Ingest a document
+    store_pdf("document.pdf", document_class="recipe")
 
-    print(f"Generated {len(embeddings)} embeddings.")
-    print("First page vector length:", len(embeddings[0]['embedding']))
+    # Classify a new document
+    pred_class, votes = classify_document("unknown.pdf")
+    print("\n📄 Predicted document class:", pred_class)
+    print("Votes by class:", votes)
