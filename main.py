@@ -6,12 +6,17 @@ from pdf2image import convert_from_path
 from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoModelForImageTextToText, AutoTokenizer, AutoModel
+import os
+
+# disable parallelism in tokensizers to avoid issues with multiprocessing
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 # ---------- Config ----------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ocr_model_name = "reducto/RolmOCR"
-# ocr_model_name = "ds4sd/SmolDocling-256M-preview"
-ocr_model_name = "allenai/olmOCR-7B-0725"
+ocr_model_name = "ds4sd/SmolDocling-256M-preview"
+# ocr_model_name = "allenai/olmOCR-7B-0725"
 text_emb_name = "BAAI/bge-large-en-v1.5"
 img_emb_name = "openai/clip-vit-large-patch14"
 faiss_path = "document_index.faiss"
@@ -19,11 +24,11 @@ db_path = "metadata.duckdb"
 
 # ---------- Load Models ----------
 print("Loading OCR model...")
-ocr_processor = AutoProcessor.from_pretrained(ocr_model_name, use_fast=True)
+ocr_processor = AutoProcessor.from_pretrained(ocr_model_name, use_fast=True,truncation=True)
 ocr_model = AutoModelForImageTextToText.from_pretrained(ocr_model_name).to(device)
 
 print("Loading text embedding model...")
-text_tokenizer = AutoTokenizer.from_pretrained(text_emb_name, use_fast=True, truncate=True)
+text_tokenizer = AutoTokenizer.from_pretrained(text_emb_name, use_fast=True)
 text_emb_model = AutoModel.from_pretrained(text_emb_name).to(device)
 
 print("Loading image embedding model...")
@@ -149,6 +154,6 @@ if __name__ == "__main__":
     store_pdf("document.pdf", document_class="recipe")
 
     # Classify a new document
-    pred_class, votes = classify_document("document.pdf.pdf")
+    pred_class, votes = classify_document("document.pdf")
     print("\n📄 Predicted document class:", pred_class)
     print("Votes by class:", votes)
